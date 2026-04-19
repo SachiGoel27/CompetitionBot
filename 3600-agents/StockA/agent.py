@@ -7,11 +7,12 @@ from collections import defaultdict
 from game.enums import Cell, Noise, MoveType, Direction, CARPET_POINTS_TABLE
 from game.move import Move
 
+# [FIXED] Unified Static Dictionary based on telemetry
 NOISE_PROBS = {
     Cell.BLOCKED: (0.5, 0.3, 0.2),
-    Cell.SPACE: (0.53, 0.24, 0.23),
-    Cell.PRIMED: (0.1, 0.8, 0.1),
-    Cell.CARPET: (0.1, 0.1, 0.8),
+    Cell.SPACE: (0.48, 0.26, 0.26),
+    Cell.PRIMED: (0.48, 0.26, 0.26),
+    Cell.CARPET: (0.48, 0.26, 0.26),
 }
 
 # ==========================================
@@ -122,8 +123,6 @@ class PlayerAgent:
             Cell.PRIMED: {0: 0, 1: 0, 2: 0}
         }
         
-        # Lock in the 0.99 threshold to bypass sensor drift.
-        # os.environ override removed entirely.
         self.weights = {
             "rat_confidence_threshold": 0.65
         }
@@ -186,13 +185,8 @@ class PlayerAgent:
             if length == 0: return 0
             
             actual_points = CARPET_POINTS_TABLE[min(length, 7)] 
-            if length == 1: potential_value = 0.5
-            elif length == 2: potential_value = 2.5  
-            elif length == 3: potential_value = 4.5  
-            elif length == 4: potential_value = 6.5  
-            else: potential_value = actual_points * 0.8 
+            potential_value = actual_points * 0.7 
 
-            # Tapered Evaluation: Prime line values rot to 0 in the endgame
             if turns_left <= 15:
                 depreciation_multiplier = max(0.2, turns_left / 15.0)
                 potential_value *= depreciation_multiplier
@@ -216,18 +210,16 @@ class PlayerAgent:
 
             if my_dist == float('inf') and en_dist == float('inf'): return 0.0
             
-            # Continuous Ownership Gradient
-            ownership = (en_dist - my_dist) / max(1, en_dist + my_dist)
-            
-            if ownership > 0:
-                # We are closer: Value scales from 1.0x up to 2.0x
-                multiplier = 1.0 + ownership 
-            else:
-                # They are closer: Value scales from 0.0x to -1.0x (Creates the Spite effect)
-                multiplier = ownership 
-                
+            # [FIXED] Greedy Selfish Evaluation
             if my_dist == 0:
-                multiplier = 1.5 # Always highly value a line we are physically standing on
+                multiplier = 1.5
+            elif my_dist < en_dist:
+                multiplier = 1.0 + (en_dist - my_dist) * 0.1
+            elif my_dist == en_dist:
+                multiplier = 0.5
+            else:
+                # The enemy is winning the race. The line is dead to us.
+                multiplier = 0.0
                 
             return potential_value * multiplier
 
@@ -259,16 +251,76 @@ class PlayerAgent:
         
         return score + (prime_bonus * 0.8) + center_bias
 
+    def quiescence_search(self, board, alpha, beta, is_maximizing, start_time, time_limit, turns_left):
+        if time.time() - start_time > time_limit:
+            raise TimeoutError()
+            
+        stand_pat = self.heuristic(board, turns_left)
+        
+        if is_maximizing:
+            if stand_pat >= beta: return beta
+            if alpha < stand_pat: alpha = stand_pat
+            
+            valid_moves = board.get_valid_moves(enemy=False, exclude_search=True)
+            tactical_moves = [m for m in valid_moves if m.move_type == MoveType.CARPET]
+            tactical_moves.sort(key=lambda m: getattr(m, 'roll_length', 0), reverse=True)
+            
+            if not tactical_moves: return stand_pat
+                
+            for move in tactical_moves:
+                next_board = board.forecast_move(move, check_ok=False)
+                if next_board is None: continue
+                
+                score = self.quiescence_search(next_board, alpha, beta, False, start_time, time_limit, turns_left - 1)
+                
+                if score >= beta: return beta
+                if score > alpha: alpha = score
+            return alpha
+            
+        else:
+            if stand_pat <= alpha: return alpha
+            if beta > stand_pat: beta = stand_pat
+
+            board.reverse_perspective()
+            valid_moves = board.get_valid_moves(enemy=False, exclude_search=True)
+            tactical_moves = [m for m in valid_moves if m.move_type == MoveType.CARPET]
+            tactical_moves.sort(key=lambda m: getattr(m, 'roll_length', 0), reverse=True)
+            
+            if not tactical_moves:
+                board.reverse_perspective()
+                return stand_pat
+                
+            for move in tactical_moves:
+                next_board = board.forecast_move(move, check_ok=False)
+                if next_board is None: continue
+                
+                next_board.reverse_perspective()
+                score = self.quiescence_search(next_board, alpha, beta, True, start_time, time_limit, turns_left - 1)
+                
+                if score <= alpha: 
+                    board.reverse_perspective()
+                    return alpha
+                if score < beta: beta = score
+                
+            board.reverse_perspective()
+            return beta
+
     def minimax(self, board, depth, alpha, beta, is_maximizing, start_time, time_limit, turns_left):
         if time.time() - start_time > time_limit:
             raise TimeoutError()
 
-        if depth == 0 or board.is_game_over():
+        if board.is_game_over():
             return self.heuristic(board, turns_left), None
+            
+        if depth == 0:
+            return self.quiescence_search(board, alpha, beta, is_maximizing, start_time, time_limit, turns_left), None
 
         state_hash = self._hash_board(board, is_maximizing)
+        hash_move = None
+        
         if state_hash in self.tt:
             cached_depth, cached_score, cached_move, flag = self.tt[state_hash]
+            hash_move = cached_move
             if cached_depth >= depth:
                 if flag == 'EXACT': return cached_score, cached_move
                 elif flag == 'LOWERBOUND': alpha = max(alpha, cached_score)
@@ -283,6 +335,7 @@ class PlayerAgent:
             if not valid_moves: return self.heuristic(board, turns_left), None
 
             def move_priority(m):
+                if m == hash_move: return float('inf') 
                 base = self.history_table.get(str(m), 0) 
                 if m.move_type == MoveType.CARPET: return base + 100 + (m.roll_length * 2)
                 if m.move_type == MoveType.PRIME: return base + 50
@@ -292,11 +345,17 @@ class PlayerAgent:
             best_move = valid_moves[0]
             max_eval = float('-inf')
             
+            bSearchPv = True 
             for move in valid_moves:
                 next_board = board.forecast_move(move, check_ok=False)
                 if next_board is None: continue
                 
-                eval_score, _ = self.minimax(next_board, depth - 1, alpha, beta, False, start_time, time_limit, turns_left - 1)
+                if bSearchPv:
+                    eval_score, _ = self.minimax(next_board, depth - 1, alpha, beta, False, start_time, time_limit, turns_left - 1)
+                else:
+                    eval_score, _ = self.minimax(next_board, depth - 1, alpha, alpha + 1, False, start_time, time_limit, turns_left - 1)
+                    if alpha < eval_score < beta: 
+                        eval_score, _ = self.minimax(next_board, depth - 1, eval_score, beta, False, start_time, time_limit, turns_left - 1)
                 
                 if eval_score > max_eval:
                     max_eval = eval_score
@@ -306,6 +365,7 @@ class PlayerAgent:
                 if beta <= alpha: 
                     self.history_table[str(move)] += (depth ** 2) 
                     break
+                bSearchPv = False
                 
             flag = 'EXACT'
             if max_eval <= orig_alpha: flag = 'UPPERBOUND'
@@ -320,16 +380,27 @@ class PlayerAgent:
                 board.reverse_perspective() 
                 return self.heuristic(board, turns_left), None
 
-            valid_moves.sort(key=lambda m: self.history_table.get(str(m), 0), reverse=True)
+            def min_move_priority(m):
+                if m == hash_move: return float('inf')
+                return self.history_table.get(str(m), 0)
+
+            valid_moves.sort(key=min_move_priority, reverse=True)
             best_move = valid_moves[0]
             min_eval = float('inf')
             
+            bSearchPv = True
             for move in valid_moves:
                 next_board = board.forecast_move(move, check_ok=False)
                 if next_board is None: continue
                 
                 next_board.reverse_perspective()
-                eval_score, _ = self.minimax(next_board, depth - 1, alpha, beta, True, start_time, time_limit, turns_left - 1)
+                
+                if bSearchPv:
+                    eval_score, _ = self.minimax(next_board, depth - 1, alpha, beta, True, start_time, time_limit, turns_left - 1)
+                else:
+                    eval_score, _ = self.minimax(next_board, depth - 1, beta - 1, beta, True, start_time, time_limit, turns_left - 1)
+                    if alpha < eval_score < beta:
+                        eval_score, _ = self.minimax(next_board, depth - 1, alpha, eval_score, True, start_time, time_limit, turns_left - 1)
                 
                 if eval_score < min_eval:
                     min_eval = eval_score
@@ -339,6 +410,7 @@ class PlayerAgent:
                 if beta <= alpha: 
                     self.history_table[str(move)] += (depth ** 2)
                     break
+                bSearchPv = False
                 
             board.reverse_perspective() 
             flag = 'EXACT'
@@ -352,23 +424,13 @@ class PlayerAgent:
         my_pos = board.player_worker.get_location()
         turns_remaining = board.player_worker.turns_left
 
+        # [NEW] Raw Sensor Override: Strike instantly if the rat is highly likely here.
+        if distance == 0:
+            return Move.search(my_pos)
+
         current_cell = board.get_cell(my_pos)
         if current_cell in self.noise_tally:
             self.noise_tally[current_cell][noise.value] += 1
-
-        # 2. Print the exact tuple needed on the final turn
-        if turns_remaining == 1:
-            print("\n" + "="*40)
-            print("FINAL SENSOR TELEMETRY (COPY/PASTE THIS):")
-            for c_type in [Cell.SPACE, Cell.PRIMED]:
-                counts = self.noise_tally[c_type]
-                total = sum(counts.values())
-                if total > 0:
-                    p0 = counts[0] / total
-                    p1 = counts[1] / total
-                    p2 = counts[2] / total
-                    print(f"Cell.{c_type.name}: ({p0:.3f}, {p1:.3f}, {p2:.3f}),  # Based on {total} samples")
-            print("="*40 + "\n")
 
         self.check_rat_resets(board)
         self.hmm.predict()
@@ -376,9 +438,7 @@ class PlayerAgent:
 
         best_rat_loc, rat_prob = self.hmm.get_best_guess()
 
-        turns_remaining = board.player_worker.turns_left
         time_left = time_left_func()
-        
         base_time = (time_left / max(1, turns_remaining)) 
         time_limit = base_time - self.TIME_BUFFER
         if turns_remaining > 20: 
@@ -413,8 +473,7 @@ class PlayerAgent:
             
         self.last_search_depth = depth - 1
         
-        # Hardcode the fallback to 0.99 as well
-        adjusted_threshold = self.weights.get("rat_confidence_threshold", 0.99)
+        adjusted_threshold = self.weights.get("rat_confidence_threshold", 0.65)
         if rat_prob >= adjusted_threshold: 
             self.last_search_confidence = rat_prob
             return Move.search(best_rat_loc)
@@ -429,7 +488,6 @@ class PlayerAgent:
         ghost_rate = (ghosts / searches * 100) if searches > 0 else 0.0
         base_log = f"Depth: {self.last_search_depth} | Ghost Rats: {ghosts} ({ghost_rate:.1f}%) | Max False Conf: {max_conf:.2f}"
         
-        # Append telemetry data if the tracker is active
         if hasattr(self, 'noise_tally'):
             telemetry = []
             for c_type in [Cell.SPACE, Cell.PRIMED]:
